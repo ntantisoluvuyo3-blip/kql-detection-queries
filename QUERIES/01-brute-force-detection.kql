@@ -1,0 +1,44 @@
+// ============================================
+// QUERY: Brute Force Attack Detection
+// MITRE ATT&CK: T1110.003 - Password Spray
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects multiple failed login attempts from a single source IP
+// targeting multiple user accounts within a short time window.
+// Indicates potential brute force or password spray attack.
+
+SigninLogs
+| where ResultType == "50126" // Invalid username or password
+| where TimeGenerated > ago(1h)
+| summarize 
+    FailedAttempts = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    AffectedUsers = make_list(UserPrincipalName),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated)
+    by IPAddress
+| where FailedAttempts >= 5 // Threshold: 5+ attempts
+| where UniqueUsers >= 3 // Threshold: 3+ different users
+| where (LastAttempt - FirstAttempt) <= 5m // Within 5 minutes
+| project
+    AlertTime = FirstAttempt,
+    SourceIP = IPAddress,
+    FailedLoginCount = FailedAttempts,
+    AffectedUserCount = UniqueUsers,
+    AffectedUsers = AffectedUsers,
+    TimeWindowMinutes = totimespan(LastAttempt - FirstAttempt),
+    Severity = case(
+        FailedAttempts >= 20, "Critical",
+        FailedAttempts >= 10, "High",
+        "Medium"
+    )
+| sort by FailedLoginCount desc
+
+// TUNING PARAMETERS:
+// FailedAttempts >= 5: Adjust higher for less sensitivity
+// UniqueUsers >= 3: Adjust higher for fewer false positives
+// TimeWindow <= 5m: Adjust lower for faster detection
