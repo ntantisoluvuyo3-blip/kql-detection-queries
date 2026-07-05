@@ -1,0 +1,122 @@
+// ============================================
+// QUERY: Data Exfiltration - Email Forwarding Rules
+// MITRE ATT&CK: T1537 - Transfer Data to Cloud Account
+// SEVERITY: Critical
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects creation or modification of email forwarding rules that redirect
+// messages to external addresses. Attackers use this for persistence and
+// data exfiltration - copies of all emails go to attacker-controlled account.
+// Indicators: forwarding to external domains, rules created by non-owners,
+// rules that hide from mailbox UI, wildcard rules forwarding all mail.
+
+OfficeActivity
+| where TimeGenerated > ago(7d)
+| where Operation == "New-InboxRule"
+    or Operation == "Set-InboxRule"
+    or Operation == "New-MailboxForwardingAddress"
+    or Operation == "Set-MailboxForwardingAddress"
+| where ResultStatus == "True"  // Successful operations
+| extend
+    RuleCreator = UserId,
+    RuleAction = Operation,
+    ForwardingAddress = tostring(parse_json(Parameters).ForwardingAddress),
+    RuleName = tostring(parse_json(Parameters).Name),
+    HideFromAddressBook = tostring(parse_json(Parameters).HideFromAddressBook),
+    MailboxOwner = tostring(parse_json(Parameters).Identity),
+    ExceptIfFrom = tostring(parse_json(Parameters).ExceptIfFrom),
+    MoveToFolder = tostring(parse_json(Parameters).MoveToFolder)
+| where 
+    // External forwarding addresses
+    (ForwardingAddress contains "@" and not(ForwardingAddress contains "@" + UserDomain))
+    or
+    // Rules that hide from UI (suspicious)
+    (HideFromAddressBook == "True")
+    or
+    // Wildcard or catch-all rules
+    (RuleName contains "catch" or RuleName contains "all" or RuleName contains "forward all" or
+     RuleName contains "*" or RuleName contains "spam" or RuleName contains "archive")
+    or
+    // Rules moving to suspicious folders
+    (MoveToFolder contains "deleted" or MoveToFolder contains "archive" or MoveToFolder contains "junk")
+| summarize
+    RuleCreationCount = count(),
+    UniqueRules = dcount(RuleName),
+    UniqueForwardingAddresses = dcount(ForwardingAddress),
+    RulesCreated = make_set(RuleName),
+    ForwardingAddresses = make_set(ForwardingAddress),
+    FirstRule = min(TimeGenerated),
+    LastRule = max(TimeGenerated)
+    by RuleCreator, MailboxOwner
+| extend
+    TimeDifference = LastRule - FirstRule,
+    IsOwnerCreatingOwnRules = iff(RuleCreator == MailboxOwner, true, false)
+| where UniqueForwardingAddresses >= 1 or UniqueRules >= 1
+| project
+    RuleCreatedByUser = RuleCreator,
+    MailboxOwner = MailboxOwner,
+    CreatedByOwner = IsOwnerCreatingOwnRules,
+    RuleCreationCount = RuleCreationCount,
+    UniqueRulesCreated = UniqueRules,
+    UniqueForwardingAddresses = UniqueForwardingAddresses,
+    SuspiciousRules = RulesCreated,
+    ExternalForwardingAddresses = ForwardingAddresses,
+    TimeWindowHours = totimespan(TimeDifference).TotalHours,
+    FirstRuleTime = FirstRule,
+    LastRuleTime = LastRule,
+    Severity = case(
+        UniqueForwardingAddresses >= 2, "Critical",
+        (IsOwnerCreatingOwnRules == false), "Critical",
+        RuleCreationCount >= 3, "High",
+        "High"
+    )
+| sort by RuleCreationCount desc
+
+// ALTERNATIVE: Detect mailbox delegation changes
+// Uncomment to use this version instead:
+/*
+OfficeActivity
+| where TimeGenerated > ago(24h)
+| where Operation == "Add-MailboxPermission"
+    or Operation == "Add-RecipientPermission"
+| where ResultStatus == "True"
+| extend
+    Grantor = UserId,
+    GrantedUser = tostring(parse_json(Parameters).User),
+    Permissions = tostring(parse_json(Parameters).AccessRights),
+    MailboxIdentity = tostring(parse_json(Parameters).Identity)
+| where GrantedUser contains "@" and not(GrantedUser contains UserDomain)
+| where Permissions contains "SendAs" or Permissions contains "SendOnBehalf" or Permissions contains "FullAccess"
+| project
+    TimeGenerated,
+    GrantedByUser = Grantor,
+    PermissionsGrantedTo = GrantedUser,
+    PermissionsLevel = Permissions,
+    AffectedMailbox = MailboxIdentity,
+    Severity = "Critical"
+| sort by TimeGenerated desc
+*/
+
+// TUNING PARAMETERS:
+// Operation values: New-InboxRule, Set-InboxRule, New/Set-MailboxForwardingAddress
+// External domain check: Adjust based on your organization's domains
+// HideFromAddressBook: Rules hidden from UI are typically suspicious
+// Rule names: Add other suspicious naming patterns specific to your environment
+// UniqueForwardingAddresses >= 1: Adjust based on false positive rate
+
+// NOTES:
+// - Email forwarding rules persist across password changes
+// - Attackers use these to exfiltrate all incoming emails
+// - Rules hidden from UI are almost always malicious
+// - Non-owner creating rules in another's mailbox = impersonation
+// - Wildcard rules forwarding all mail = mass exfiltration
+// - External forwarding is legitimate but should be authorized
+// - Review RuleCreator vs MailboxOwner - should usually match
+// - Service accounts shouldn't create rules (except automation)
+// - Multiple rules created rapidly = suspicious pattern
+// - Can correlate with mailbox access logs for broader context
+// - Requires Office 365 audit logging enabled (typically on by default)
+// - Rules can be used for legitimate delegation but external forwarding is rare
