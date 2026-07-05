@@ -1,0 +1,75 @@
+// ============================================
+// QUERY: Lateral Movement - Pass the Hash Detection
+// MITRE ATT&CK: T1550.002 - Use Alternate Authentication Material: Pass the Hash
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects potential Pass-the-Hash (PtH) attacks where attackers use stolen
+// NTLM hashes to authenticate without knowing the plaintext password.
+// Indicators: Same account logging in from multiple IPs with NTLM authentication
+// in rapid succession, or authentication from unusual locations.
+
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where AuthenticationProtocol == "NTLM"
+    or AuthenticationProtocol == "Basic"
+| where ResultType == 0  // Successful logins
+| extend
+    UserAccount = UserPrincipalName,
+    SourceIP = IPAddress,
+    AuthMethod = AuthenticationProtocol,
+    LocationInfo = LocationDetails.countryOrRegion,
+    ClientAppUsed = ClientAppUsed
+| summarize
+    LoginCount = count(),
+    UniqueIPs = dcount(SourceIP),
+    UniqueCountries = dcount(LocationInfo),
+    IPs = make_set(SourceIP),
+    Countries = make_set(LocationInfo),
+    FirstLogin = min(TimeGenerated),
+    LastLogin = max(TimeGenerated),
+    Clients = make_set(ClientAppUsed)
+    by UserAccount
+| where LoginCount >= 3  // 3+ logins
+| where UniqueIPs >= 2   // From 2+ different IPs
+| extend
+    TimeDifference = LastLogin - FirstLogin,
+    LoginsPerMinute = LoginCount / (totimespan(TimeDifference).TotalMinutes + 1)
+| where TimeDifference <= 30m  // Within 30 minutes
+| project
+    UserAccount = UserAccount,
+    LoginCount = LoginCount,
+    UniqueIPCount = UniqueIPs,
+    UniqueCountryCount = UniqueCountries,
+    SourceIPs = IPs,
+    Countries = Countries,
+    TimeWindowMinutes = totimespan(TimeDifference).TotalMinutes,
+    AuthenticationMethod = "NTLM/Basic",
+    FirstLoginTime = FirstLogin,
+    LastLoginTime = LastLogin,
+    ClientApps = Clients,
+    LoginsPerMinute = LoginsPerMinute,
+    Severity = case(
+        UniqueCountries >= 2, "Critical",
+        LoginCount >= 5, "High",
+        "Medium"
+    )
+| sort by LoginCount desc
+
+// TUNING PARAMETERS:
+// LoginCount >= 3: Adjust based on normal user behavior (3, 5, 10)
+// UniqueIPs >= 2: Number of different source IPs (2, 3, 5)
+// TimeDifference <= 30m: Time window for rapid logins (15m, 30m, 60m)
+// AuthenticationProtocol: Can add others like "Digest" or "Kerberos"
+
+// NOTES:
+// - NTLM and Basic authentication are older and less secure
+// - Modern environments should use Kerberos or modern protocols
+// - Pass-the-Hash attackers often use NTLM for stealth
+// - Multiple IPs in short time window = highly suspicious
+// - Cross-country logins in minutes = impossible travel (very suspicious)
+// - Review ClientApps - legitimate clients vs suspicious tools
+// - Correlate with endpoint logs for suspicious process execution
