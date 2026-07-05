@@ -1,0 +1,119 @@
+// ============================================
+// QUERY: Credential Theft - OAuth Abuse Detection
+// MITRE ATT&CK: T1528 - Steal Application Access Token
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects suspicious OAuth application consent requests and grants.
+// Attackers trick users into authorizing malicious applications to access
+// email, contacts, and other sensitive data. This creates a persistent
+// backdoor even if the original credentials are changed.
+
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName == "Consent to application"
+    or OperationName == "Add service principal"
+    or OperationName == "Add OAuth2PermissionGrant"
+| where ActivityResult == "Success"
+| extend
+    ApplicationName = tostring(TargetResources[0].displayName),
+    AppId = tostring(TargetResources[0].id),
+    ConsentingUser = tostring(TargetResources[0].userPrincipalName),
+    InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
+    InitiatedByIP = tostring(InitiatedBy.user.ipAddress),
+    PermissionsGranted = tostring(TargetResources[0].modifiedProperties),
+    IsFirstPartyApp = iff(
+        ApplicationName contains "Microsoft" or
+        ApplicationName contains "Azure" or
+        ApplicationName contains "Office" or
+        ApplicationName contains "Outlook" or
+        ApplicationName contains "Teams" or
+        ApplicationName contains "OneDrive",
+        true,
+        false
+    ),
+    IsSuspiciousApp = iff(
+        ApplicationName contains "Excel" or
+        ApplicationName contains "Document" or
+        ApplicationName contains "Cloud" or
+        ApplicationName contains "Storage" or
+        ApplicationName contains "Sync" or
+        ApplicationName contains "Manager",
+        true,
+        false
+    )
+| where IsFirstPartyApp == false  // Focus on non-Microsoft apps
+| summarize
+    ConsentCount = count(),
+    UniqueApps = dcount(ApplicationName),
+    AppsGranted = make_set(ApplicationName),
+    FirstConsent = min(TimeGenerated),
+    LastConsent = max(TimeGenerated),
+    InitiatedByUsers = make_set(InitiatedByUser),
+    SourceIPs = make_set(InitiatedByIP)
+    by ConsentingUser
+| extend
+    TimeDifference = LastConsent - FirstConsent
+| where UniqueApps >= 1  // Any non-Microsoft app
+| project
+    ConsentingUser = ConsentingUser,
+    ConsentCount = ConsentCount,
+    UniqueNonMicrosoftApps = UniqueApps,
+    ApplicationsGranted = AppsGranted,
+    InitiatedByUsers = InitiatedByUsers,
+    SourceIPs = SourceIPs,
+    TimeWindowHours = totimespan(TimeDifference).TotalHours,
+    FirstConsentTime = FirstConsent,
+    LastConsentTime = LastConsent,
+    Severity = case(
+        UniqueApps >= 3, "Critical",
+        UniqueApps >= 2, "High",
+        ConsentCount >= 2, "High",
+        "Medium"
+    )
+| sort by UniqueNonMicrosoftApps desc
+
+// ALTERNATIVE: Detect high-risk permission grants
+// Uncomment to use this version instead:
+/*
+AuditLogs
+| where OperationName == "Consent to application"
+| where TimeGenerated > ago(24h)
+| extend
+    AppName = tostring(TargetResources[0].displayName),
+    Permissions = tostring(TargetResources[0].modifiedProperties)
+| where Permissions contains "Mail.Read"
+    or Permissions contains "Calendars.Read"
+    or Permissions contains "Contacts.Read"
+    or Permissions contains "User.Read.All"
+    or Permissions contains "Directory.Read.All"
+| project
+    TimeGenerated,
+    Application = AppName,
+    PermissionsRequested = Permissions,
+    ConsentingUser = tostring(TargetResources[0].userPrincipalName),
+    InitiatedBy = tostring(InitiatedBy.user.userPrincipalName),
+    Severity = "High"
+| sort by TimeGenerated desc
+*/
+
+// TUNING PARAMETERS:
+// IsFirstPartyApp: Add/remove Microsoft app names based on your environment
+// UniqueApps >= 1: Adjust threshold (1 = any non-MS, 2+ = multiple apps)
+// TimeGenerated > ago(7d): Adjust lookback window (1d, 7d, 30d)
+// Permissions: Add other sensitive permissions specific to threats you track
+
+// NOTES:
+// - OAuth grants are persistent - changing password won't revoke access
+// - Phishing campaigns often target users with OAuth consent screens
+// - Attackers look for permissions: Mail.Read, Contacts.Read, User.Read.All
+// - First-party Microsoft apps are trusted, focus on third-party apps
+// - Review InitiatedByUsers - user accounts vs service principals
+// - Suspicious apps often have generic names: "Document Manager", "Cloud Sync"
+// - Users rarely grant multiple app permissions in short time windows
+// - This creates persistent backdoor even after account compromise remediation
+// - Consider blocking OAuth consent from non-admin users
+// - Requires Azure AD audit logging enabled
