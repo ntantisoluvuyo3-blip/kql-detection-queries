@@ -1,0 +1,76 @@
+// ============================================
+// QUERY: Lateral Movement - Admin Shares Access
+// MITRE ATT&CK: T1570 - Lateral Tool Transfer
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects access to administrative network shares (C$, Admin$, IPC$).
+// Attackers use these hidden shares for lateral movement, deploying malware,
+// and accessing sensitive files across the network. Normal users rarely
+// access these shares - detection indicates potential compromise.
+
+SecurityEvent
+| where EventID == 5140  // Network share object accessed
+| where TimeGenerated > ago(24h)
+| extend
+    AccessedShare = RelatedMetadata,
+    SourceIP = IpAddress,
+    SourceAccount = Account,
+    ComputerAccessed = Computer,
+    AccessStatus = Status
+| where AccessedShare contains "Admin$"
+    or AccessedShare contains "C$"
+    or AccessedShare contains "IPC$"
+| where AccessStatus == "Success"
+| summarize
+    AccessCount = count(),
+    UniqueShares = dcount(AccessedShare),
+    UniqueTargets = dcount(ComputerAccessed),
+    UniqueSourceIPs = dcount(SourceIP),
+    Shares = make_set(AccessedShare),
+    TargetComputers = make_set(ComputerAccessed),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated)
+    by SourceAccount
+| extend
+    TimeDifference = LastAccess - FirstAccess,
+    AccessesPerMinute = AccessCount / (totimespan(TimeDifference).TotalMinutes + 1)
+| where AccessCount >= 2  // 2+ accesses
+| project
+    SourceAccount = SourceAccount,
+    AccessCount = AccessCount,
+    UniqueAdminShares = UniqueShares,
+    TargetComputersCount = UniqueTargets,
+    SourceIPCount = UniqueSourceIPs,
+    SharesAccessed = Shares,
+    TargetComputers = TargetComputers,
+    TimeWindowMinutes = totimespan(TimeDifference).TotalMinutes,
+    FirstAccessTime = FirstAccess,
+    LastAccessTime = LastAccess,
+    AccessesPerMinute = AccessesPerMinute,
+    Severity = case(
+        UniqueTargets >= 3, "Critical",
+        UniqueShares >= 2, "High",
+        AccessCount >= 5, "High",
+        "Medium"
+    )
+| sort by AccessCount desc
+
+// TUNING PARAMETERS:
+// AccessCount >= 2: Minimum number of accesses (2, 3, 5)
+// UniqueTargets >= 3: Number of different target computers (2, 3, 5)
+// AccessStatus == "Success": Can include "Failure" to see failed attempts
+// Share names: Add other admin shares specific to your environment
+
+// NOTES:
+// - C$ = C drive share, Admin$ = admin share, IPC$ = inter-process communication
+// - Legitimate admins DO access these, but usually from specific accounts/times
+// - Rapid access to multiple computers = lateral movement indicator
+// - Review SourceAccount - service accounts vs regular user accounts
+// - Correlate with process execution logs on target computers
+// - Normal users should NEVER access these shares
+// - False positives: Legitimate admin/IT tools, automated monitoring
+// - Can be combined with credential compromise detection
