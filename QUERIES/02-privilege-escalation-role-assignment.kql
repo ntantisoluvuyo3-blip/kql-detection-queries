@@ -1,0 +1,58 @@
+// ============================================
+// QUERY: Privilege Escalation via Role Assignment
+// MITRE ATT&CK: T1548 - Abuse Elevation Control Mechanism
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects high-privilege role assignments to service principals, 
+// applications, or user accounts. These assignments could indicate 
+// an attacker attempting to escalate privileges in the environment.
+// Monitors for: Global Admin, Security Admin, Exchange Admin roles.
+
+AuditLogs
+| where OperationName == "Add app role assignment to service principal"
+    or OperationName == "Add member to group"
+    or OperationName == "Update user"
+| where ActivityResult == "Success"
+| where TimeGenerated > ago(24h)
+| extend 
+    TargetUser = tostring(TargetResources[0].userPrincipalName),
+    TargetServicePrincipal = tostring(TargetResources[0].displayName),
+    AssignedRole = case(
+        tostring(TargetResources[0].displayName) contains "Global Administrator", "Global Admin",
+        tostring(TargetResources[0].displayName) contains "Security Administrator", "Security Admin",
+        tostring(TargetResources[0].displayName) contains "Exchange Administrator", "Exchange Admin",
+        tostring(TargetResources[0].displayName) contains "Privileged Role Administrator", "Privileged Role Admin",
+        tostring(TargetResources[0].displayName)
+    )
+| where AssignedRole in ("Global Admin", "Security Admin", "Exchange Admin", "Privileged Role Admin")
+| project
+    TimeGenerated,
+    InitiatedBy = tostring(InitiatedBy.user.userPrincipalName),
+    InitiatedByIP = tostring(InitiatedBy.user.ipAddress),
+    Operation = OperationName,
+    TargetUser = TargetUser,
+    TargetServicePrincipal = TargetServicePrincipal,
+    PrivilegeLevel = AssignedRole,
+    Result = ActivityResult,
+    Severity = case(
+        AssignedRole == "Global Admin", "Critical",
+        AssignedRole in ("Security Admin", "Privileged Role Admin"), "High",
+        "Medium"
+    )
+| sort by TimeGenerated desc
+
+// TUNING PARAMETERS:
+// TimeGenerated > ago(24h): Adjust lookback window (24h, 7d, 30d)
+// Roles monitored: Add/remove roles based on your environment
+// Success filter: Can include "Unknown" or other results if needed
+// Severity mapping: Adjust role severity based on your risk tolerance
+
+// NOTES:
+// - Monitor InitiatedBy field for suspicious user accounts
+// - High-privilege role assignments should be rare and documented
+// - Service principal role assignments are particularly suspicious
+// - Consider alerting on ANY high-privilege role assignment
