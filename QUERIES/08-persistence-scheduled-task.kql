@@ -1,0 +1,124 @@
+// ============================================
+// QUERY: Persistence - Scheduled Task Detection
+// MITRE ATT&CK: T1053.005 - Scheduled Task/Job: Scheduled Task
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects creation of suspicious scheduled tasks used for persistence.
+// Attackers create scheduled tasks to execute malware, backdoors, or
+// credential harvesters on a recurring basis. Indicators: unusual task names,
+// suspicious command lines, tasks running as SYSTEM, created outside business hours.
+
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (
+    4698,   // Scheduled task created
+    4702,   // Scheduled task updated
+    4699    // Scheduled task deleted (suspicious)
+)
+| extend
+    TaskName = tolower(tostring(parse_json(EventData).TaskName)),
+    TaskPath = tolower(tostring(parse_json(EventData).TaskContentNew)),
+    CreatedBy = Account,
+    CreatedByIP = IpAddress,
+    Computer = Computer
+| where 
+    // Suspicious task names
+    (TaskName contains "update" and TaskName contains "check") or
+    (TaskName contains "system" and TaskName contains "maintenance") or
+    (TaskName contains "windows" and (TaskName contains "system" or TaskName contains "temp")) or
+    (TaskName contains "svchost" or TaskName contains "rundll32" or TaskName contains "powershell") or
+    TaskName contains "scanner" or
+    TaskName contains "checker" or
+    TaskName contains "monitor" or
+    TaskName contains "backup" or
+    TaskName matches regex @"^[a-z0-9]{12,}$"  // Random strings
+    or
+    // Suspicious command patterns
+    (TaskPath contains "powershell" and TaskPath contains "-enc") or
+    (TaskPath contains "cmd" and TaskPath contains "/c") or
+    (TaskPath contains "rundll32" and TaskPath contains "javascript") or
+    (TaskPath contains "regsvr32" and TaskPath contains "/s") or
+    (TaskPath contains "mshta" or TaskPath contains "wscript")
+| summarize
+    TaskCreationCount = count(),
+    UniqueTasks = dcount(TaskName),
+    SuspiciousTasks = make_set(TaskName),
+    CommandPatterns = make_set(TaskPath),
+    FirstTask = min(TimeGenerated),
+    LastTask = max(TimeGenerated)
+    by Computer, CreatedBy
+| extend
+    TimeDifference = LastTask - FirstTask
+| where UniqueTasks >= 1  // Any suspicious task
+| project
+    ComputerName = Computer,
+    CreatedByAccount = CreatedBy,
+    SuspiciousTaskCount = TaskCreationCount,
+    UniqueTaskCount = UniqueTasks,
+    TaskNamesDetected = SuspiciousTasks,
+    CommandPatternsDetected = CommandPatterns,
+    TimeWindowHours = totimespan(TimeDifference).TotalHours,
+    FirstTaskCreationTime = FirstTask,
+    LastTaskCreationTime = LastTask,
+    Severity = case(
+        TaskCreationCount >= 3, "Critical",
+        UniqueTasks >= 2, "High",
+        TaskCreationCount >= 2, "High",
+        "Medium"
+    )
+| sort by TaskCreationCount desc
+
+// ALTERNATIVE: Detect scheduled tasks with suspicious runtime behavior
+// Uncomment to use this version instead:
+/*
+SecurityEvent
+| where EventID == 4688  // Process creation
+| where TimeGenerated > ago(24h)
+| extend
+    ProcessPath = tolower(Process),
+    ParentProcess = tolower(ParentProcessName),
+    CommandLine = tolower(CommandLine)
+| where ParentProcess contains "taskschd.exe" or ParentProcess contains "svchost.exe"
+| where (ProcessPath contains "powershell" or ProcessPath contains "cmd" or 
+         ProcessPath contains "rundll32" or ProcessPath contains "wscript" or
+         ProcessPath contains "mshta")
+| where CommandLine contains "hidden" or CommandLine contains "-enc" or
+        CommandLine contains "bypass" or CommandLine contains "noprofile"
+| summarize
+    SuspiciousProcessCount = count(),
+    ProcessesDetected = make_set(ProcessPath),
+    FirstExecution = min(TimeGenerated),
+    LastExecution = max(TimeGenerated)
+    by Computer, Account
+| project
+    ComputerName = Computer,
+    ExecutingAccount = Account,
+    SuspiciousProcessCount = SuspiciousProcessCount,
+    ProcessesDetected = ProcessesDetected,
+    FirstExecutionTime = FirstExecution,
+    LastExecutionTime = LastExecution,
+    Severity = "High"
+*/
+
+// TUNING PARAMETERS:
+// EventID values: 4698 (create), 4702 (update), 4699 (delete)
+// TaskName patterns: Add other suspicious names based on your environment
+// Regex pattern: Adjust length for random string detection
+// CommandLine indicators: Add other suspicious PowerShell switches
+
+// NOTES:
+// - Scheduled tasks run with SYSTEM privileges (high impact)
+// - Attackers use them for recurring malware execution
+// - Task names often mimic legitimate Windows tasks for stealth
+// - PowerShell with -enc (encoding) = strong indicator of malicious use
+// - /S (silent) flag on regsvr32 = DLL execution without UI
+// - MSHTA = Microsoft HTML Application execution (fileless attack)
+// - Legitimate scheduled tasks usually created by SYSTEM or known admins
+// - Review CreatedByAccount - user accounts shouldn't create system tasks
+// - Multiple task creation in short time = malware spreading
+// - Requires Windows Event Forwarding or Sysmon for reliable detection
+// - Can correlate with file creation in Task Scheduler directories
