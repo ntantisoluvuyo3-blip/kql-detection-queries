@@ -1,0 +1,136 @@
+// ============================================
+// QUERY: Persistence - Startup Folder Modifications
+// MITRE ATT&CK: T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects files created in Windows Startup folders or modifications to
+// registry Run/RunOnce keys used for persistence. Attackers place malware
+// in startup locations so it executes automatically when users log in.
+// Indicators: New .exe, .bat, .cmd, .vbs, .js files in startup paths.
+
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID == 11  // File created
+    or EventID == 13   // Registry value set
+| extend
+    CreatedFile = tolower(tostring(parse_json(EventData).TargetFilename)),
+    RegistryPath = tolower(tostring(parse_json(EventData).TargetObject)),
+    RegistryValue = tolower(tostring(parse_json(EventData).Details)),
+    User = Account,
+    UserIP = IpAddress,
+    Computer = Computer
+| where 
+    // Startup folder locations
+    (CreatedFile contains "\\startup" or
+     CreatedFile contains "\\appdata\\roaming\\microsoft\\windows\\start menu" or
+     CreatedFile contains "\\programdata\\microsoft\\windows\\start menu" or
+     CreatedFile contains "\\all users\\startup")
+    or
+    // Registry Run/RunOnce keys
+    (RegistryPath contains "\\run" or
+     RegistryPath contains "\\runonce" or
+     RegistryPath contains "currentversion\\run")
+| where
+    // Suspicious file types
+    (CreatedFile endswith ".exe" or
+     CreatedFile endswith ".bat" or
+     CreatedFile endswith ".cmd" or
+     CreatedFile endswith ".vbs" or
+     CreatedFile endswith ".js" or
+     CreatedFile endswith ".jar" or
+     CreatedFile endswith ".scr")
+    or
+    // Registry modifications with suspicious values
+    (RegistryPath contains "run" and
+     (RegistryValue contains "powershell" or
+      RegistryValue contains "cmd" or
+      RegistryValue contains "rundll32" or
+      RegistryValue contains "wscript" or
+      RegistryValue contains "temp" or
+      RegistryValue contains "appdata"))
+| summarize
+    ModificationCount = count(),
+    UniqueFiles = dcount(CreatedFile),
+    UniqueRegistry = dcount(RegistryPath),
+    FilesCreated = make_set(CreatedFile),
+    RegistryKeysModified = make_set(RegistryPath),
+    FirstModification = min(TimeGenerated),
+    LastModification = max(TimeGenerated)
+    by Computer, User
+| extend
+    TimeDifference = LastModification - FirstModification
+| where UniqueFiles >= 1 or UniqueRegistry >= 1
+| project
+    ComputerName = Computer,
+    ModifiedByUser = User,
+    ModificationCount = ModificationCount,
+    UniqueFilesCreated = UniqueFiles,
+    UniqueRegistryKeysModified = UniqueRegistry,
+    SuspiciousFilesDetected = FilesCreated,
+    RegistryKeysDetected = RegistryKeysModified,
+    TimeWindowMinutes = totimespan(TimeDifference).TotalMinutes,
+    FirstModificationTime = FirstModification,
+    LastModificationTime = LastModification,
+    Severity = case(
+        ModificationCount >= 3, "Critical",
+        UniqueFiles >= 2 or UniqueRegistry >= 2, "High",
+        ModificationCount >= 2, "High",
+        "Medium"
+    )
+| sort by ModificationCount desc
+
+// ALTERNATIVE: Detect process execution from startup locations
+// Uncomment to use this version instead:
+/*
+SecurityEvent
+| where EventID == 4688  // Process creation
+| where TimeGenerated > ago(24h)
+| extend
+    ProcessPath = tolower(Process),
+    ParentProcess = tolower(ParentProcessName)
+| where ProcessPath contains "startup" or
+        ProcessPath contains "appdata\\roaming\\microsoft\\windows" or
+        ProcessPath contains "start menu"
+| where ProcessPath endswith ".exe" or
+        ProcessPath endswith ".bat" or
+        ProcessPath endswith ".cmd" or
+        ProcessPath endswith ".vbs"
+| summarize
+    ProcessExecutionCount = count(),
+    ProcessesFromStartup = make_set(ProcessPath),
+    FirstExecution = min(TimeGenerated),
+    LastExecution = max(TimeGenerated)
+    by Computer, Account
+| project
+    ComputerName = Computer,
+    ExecutingAccount = Account,
+    ProcessExecutionCount = ProcessExecutionCount,
+    ProcessesDetected = ProcessesFromStartup,
+    FirstExecutionTime = FirstExecution,
+    LastExecutionTime = LastExecution,
+    Severity = "High"
+*/
+
+// TUNING PARAMETERS:
+// EventID: 11 (file creation), 13 (registry modification)
+// File extensions: Add others specific to your environment (.ps1, .hta, etc.)
+// Startup paths: Add other startup locations used in your organization
+// Registry keys: Add other autostart registry locations (HKCU\Software\Microsoft\Windows\...)
+// ModificationCount >= 3: Adjust based on your false positive rate
+
+// NOTES:
+// - Startup folders = files auto-execute when user logs in
+// - Registry Run keys = similar persistence mechanism via registry
+// - Attackers prefer this method because it survives reboot
+// - Legitimate software may use startup, but usually from installer
+// - User-created startup items are rare (mostly admin/system)
+// - Each new executable in startup = potential persistent backdoor
+// - PowerShell in startup = strong indicator of malicious use
+// - Review ModifiedByUser - service accounts shouldn't modify startup
+// - Can correlate with file hash to identify known malware
+// - Requires Windows Event Forwarding or Sysmon for file creation events
+// - Registry auditing must be enabled for Run/RunOnce detection
