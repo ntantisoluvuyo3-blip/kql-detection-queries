@@ -1,0 +1,61 @@
+// ============================================
+// QUERY: Suspicious Admin Account Creation
+// MITRE ATT&CK: T1547 - Boot or Logon Autostart Execution
+// SEVERITY: Critical
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects creation of new user accounts with administrative privileges.
+// This is a persistence technique where attackers create backup admin accounts
+// for continued access even if their primary compromise is discovered.
+// Flags: New admin creation, especially outside business hours.
+
+AuditLogs
+| where OperationName == "Add user"
+    or OperationName == "Update user"
+| where ActivityResult == "Success"
+| where TimeGenerated > ago(7d)
+| extend
+    NewUserName = tostring(TargetResources[0].userPrincipalName),
+    CreatedBy = tostring(InitiatedBy.user.userPrincipalName),
+    CreatedByIP = tostring(InitiatedBy.user.ipAddress),
+    IsAdminAccount = iff(
+        tostring(TargetResources[0].displayName) contains "Admin" or
+        tostring(TargetResources[0].userPrincipalName) contains "admin",
+        true,
+        false
+    ),
+    CreationTime = TimeGenerated,
+    DayOfWeek = dayofweek(TimeGenerated),
+    HourOfDay = hour(TimeGenerated)
+| where IsAdminAccount == true
+| project
+    TimeGenerated = CreationTime,
+    NewAdminAccount = NewUserName,
+    CreatedBy = CreatedBy,
+    CreatedFromIP = CreatedByIP,
+    Operation = OperationName,
+    DayOfWeek = DayOfWeek,
+    HourOfDay = HourOfDay,
+    IsOffHours = iff(HourOfDay < 8 or HourOfDay > 18, true, false),
+    IsWeekend = iff(DayOfWeek in (0, 6), true, false),
+    Severity = case(
+        (IsOffHours == true or IsWeekend == true), "Critical",
+        "High"
+    )
+| sort by TimeGenerated desc
+
+// TUNING PARAMETERS:
+// TimeGenerated > ago(7d): Adjust lookback (1d, 7d, 30d)
+// Admin detection: Adjust keywords based on naming conventions
+// Office hours: Change 8 (8 AM) and 18 (6 PM) based on your timezone
+// Weekend detection: Adjust if your org works weekends (0=Sun, 6=Sat)
+
+// NOTES:
+// - New admin accounts created outside business hours are highly suspicious
+// - Service accounts created by automation tools may generate false positives
+// - Review CreatedBy field - admin accounts should be created by authorized admins
+// - Consider correlating with failed login attempts before account creation
+// - Legitimate admin account creation should have documented approval/tickets
