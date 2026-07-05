@@ -1,0 +1,117 @@
+// ============================================
+// QUERY: Data Exfiltration - Bulk Download Detection
+// MITRE ATT&CK: T1537 - Transfer Data to Cloud Account
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects bulk file downloads that may indicate data exfiltration.
+// Attackers download sensitive files before uploading to cloud storage
+// or external servers. Indicators: multiple large downloads, rapid download
+// speed, downloads of archives/sensitive file types, unusual destinations.
+
+SecurityEvent
+| where TimeGenerated > ago(24h)
+| where EventID == 5145  // Network share object accessed
+    or EventID == 5140   // Network share accessed
+| extend
+    AccessedShare = tolower(tostring(parse_json(EventData).ShareName)),
+    RelativeTarget = tolower(tostring(parse_json(EventData).RelativeTargetName)),
+    AccessRequest = tolower(tostring(parse_json(EventData).AccessRequest)),
+    User = Account,
+    Computer = Computer,
+    SourceIP = IpAddress
+| where AccessRequest contains "ReadData" or AccessRequest contains "ReadAttributes"
+| where 
+    // Sensitive file types
+    (RelativeTarget endswith ".xlsx" or RelativeTarget endswith ".docx" or
+     RelativeTarget endswith ".pptx" or RelativeTarget endswith ".pdf" or
+     RelativeTarget endswith ".zip" or RelativeTarget endswith ".rar" or
+     RelativeTarget endswith ".7z" or RelativeTarget endswith ".csv" or
+     RelativeTarget endswith ".json" or RelativeTarget endswith ".sql" or
+     RelativeTarget endswith ".mdb" or RelativeTarget endswith ".db")
+    or
+    // Sensitive locations
+    (AccessedShare contains "finance" or AccessedShare contains "hr" or
+     AccessedShare contains "legal" or AccessedShare contains "confidential" or
+     AccessedShare contains "secret" or AccessedShare contains "backup" or
+     AccessedShare contains "database" or AccessedShare contains "archive")
+| summarize
+    FileAccessCount = count(),
+    UniqueFiles = dcount(RelativeTarget),
+    FilesAccessed = make_set(RelativeTarget),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated)
+    by Computer, User, SourceIP
+| extend
+    TimeDifference = LastAccess - FirstAccess,
+    FilesPerMinute = FileAccessCount / (totimespan(TimeDifference).TotalMinutes + 1)
+| where FileAccessCount >= 5  // 5+ files accessed
+| project
+    ComputerName = Computer,
+    UserAccount = User,
+    SourceIPAddress = SourceIP,
+    FileAccessCount = FileAccessCount,
+    UniqueFilesAccessed = UniqueFiles,
+    SensitiveFilesDetected = FilesAccessed,
+    TimeWindowMinutes = totimespan(TimeDifference).TotalMinutes,
+    FilesAccessedPerMinute = FilesPerMinute,
+    FirstAccessTime = FirstAccess,
+    LastAccessTime = LastAccess,
+    Severity = case(
+        FileAccessCount >= 20, "Critical",
+        FileAccessCount >= 10, "High",
+        FilesPerMinute >= 2, "High",
+        "Medium"
+    )
+| sort by FileAccessCount desc
+
+// ALTERNATIVE: Detect cloud upload activity after file access
+// Uncomment to use this version instead:
+/*
+let file_access = SecurityEvent
+| where EventID == 5145
+| where TimeGenerated > ago(24h)
+| where tostring(parse_json(EventData).AccessRequest) contains "ReadData"
+| extend User = Account
+| summarize FileAccessCount = count() by User, TimeGenerated;
+
+let cloud_activity = OfficeActivity
+| where TimeGenerated > ago(24h)
+| where Operation == "FileUploaded" or Operation == "FileCopied"
+| where UserId has_any ("@outlook.com", "@gmail.com", "onedrive", "dropbox", "box")
+| extend User = extract("([^@]+)@", 1, UserId)
+| summarize CloudUploadCount = count() by User, TimeGenerated;
+
+file_access
+| join kind=inner (cloud_activity) on User
+| where TimeGenerated >= TimeGenerated1 - 30m and TimeGenerated <= TimeGenerated1 + 30m
+| project
+    User = User,
+    FileAccessCount = FileAccessCount,
+    CloudUploadCount = CloudUploadCount,
+    Pattern = "File access followed by cloud upload",
+    Severity = "Critical"
+*/
+
+// TUNING PARAMETERS:
+// FileAccessCount >= 5: Adjust based on normal user download patterns
+// FilesPerMinute >= 2: Rapid download detection threshold
+// EventID values: 5145 (share access), 5140 (share object access)
+// File types: Add other sensitive extensions specific to your environment
+// Share names: Add other sensitive locations (accounting, engineering, etc.)
+
+// NOTES:
+// - Exfiltration often precedes cloud uploads (copy files locally first)
+// - Bulk downloads of sensitive files = strong exfiltration indicator
+// - Archives (.zip, .rar) are favorite exfiltration containers
+// - Database files (.mdb, .db, .sql) indicate sensitive data theft
+// - Rapid downloads (2+ files/min) = automated tool or urgent exfil
+// - Review SourceIP - external IPs more suspicious than internal
+// - User accounts shouldn't access finance/HR/legal shares normally
+// - Correlate with network data transfer volume for more context
+// - Large file transfers may also indicate exfiltration
+// - Requires Windows Event Forwarding or Sysmon for reliable detection
+// - Can combine with DLP (Data Loss Prevention) alerts for additional confirmation
