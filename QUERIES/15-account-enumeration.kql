@@ -1,0 +1,125 @@
+// ============================================
+// QUERY: Account Enumeration Detection
+// MITRE ATT&CK: T1087 - Account Discovery
+// SEVERITY: Medium
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects account enumeration attacks where attackers probe the directory
+// to discover valid user accounts. Used as reconnaissance before credential
+// attacks. Indicators: repeated failed logon attempts with different usernames,
+// rapid authentication attempts, directory queries from unusual sources.
+
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where ResultType in (
+    "50126",  // Invalid username or password
+    "50128",  // Invalid client application ID
+    "50053",  // Invalid username or password
+    "50055",  // Invalid username or password
+    "50058",  // Silent sign-in request failed
+    "50074",  // Strong auth required
+    "50076",  // MFA required
+    "50079"   // Invalid username or password
+)
+| extend
+    AttemptedUser = UserPrincipalName,
+    SourceIP = IPAddress,
+    FailureReason = ResultType,
+    UserDomain = extract("@(.+)", 1, UserPrincipalName),
+    AuthMethod = AuthenticationDetails[0].authenticationMethod
+| where AttemptedUser != ""
+| summarize
+    FailedAttemptCount = count(),
+    UniqueAttemptedUsers = dcount(AttemptedUser),
+    UniqueDomains = dcount(UserDomain),
+    AttemptedUsers = make_list(AttemptedUser, 100),  // Limit to 100 for readability
+    AttemptedUsersCount = dcount(AttemptedUser),
+    FailureReasons = make_set(FailureReason),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated)
+    by SourceIP
+| extend
+    TimeDifference = LastAttempt - FirstAttempt,
+    AttemptsPerMinute = FailedAttemptCount / (totimespan(TimeDifference).TotalMinutes + 1),
+    IsRapidEnumeration = iff(AttemptsPerMinute >= 2 and UniqueAttemptedUsers >= 5, true, false)
+| where FailedAttemptCount >= 10  // 10+ failed attempts from single IP
+| project
+    SourceIPAddress = SourceIP,
+    TotalFailedAttempts = FailedAttemptCount,
+    UniqueUserAccountsTargeted = UniqueAttemptedUsers,
+    UniqueDomainTargeted = UniqueDomains,
+    SampleAttemptedUsers = AttemptedUsers,
+    FailureTypesObserved = FailureReasons,
+    AttemptsPerMinute = AttemptsPerMinute,
+    RapidEnumerationPattern = IsRapidEnumeration,
+    TimeWindowMinutes = totimespan(TimeDifference).TotalMinutes,
+    FirstAttemptTime = FirstAttempt,
+    LastAttemptTime = LastAttempt,
+    Severity = case(
+        (IsRapidEnumeration == true and UniqueAttemptedUsers >= 20), "High",
+        (AttemptsPerMinute >= 5 and UniqueAttemptedUsers >= 15), "High",
+        (UniqueAttemptedUsers >= 10 and FailedAttemptCount >= 20), "Medium",
+        "Low"
+    )
+| sort by UniqueUserAccountsTargeted desc
+
+// ALTERNATIVE: Detect directory enumeration via API calls
+// Uncomment to use this version instead:
+/*
+AuditLogs
+| where TimeGenerated > ago(24h)
+| where OperationName == "List directory contents"
+    or OperationName == "Get user"
+    or OperationName == "List users"
+    or OperationName == "Search directory"
+| where ResultDescription != "Success"
+| extend
+    RequestingUser = InitiatedBy.user.userPrincipalName,
+    RequestingIP = InitiatedBy.user.ipAddress,
+    TargetResourceName = TargetResources[0].displayName
+| summarize
+    FailedDirectoryQueries = count(),
+    UniqueTargets = dcount(TargetResourceName),
+    FirstQuery = min(TimeGenerated),
+    LastQuery = max(TimeGenerated)
+    by RequestingIP, RequestingUser
+| where FailedDirectoryQueries >= 5
+| project
+    RequestingUserAccount = RequestingUser,
+    RequestingIPAddress = RequestingIP,
+    FailedDirectoryQueryCount = FailedDirectoryQueries,
+    UniqueTargetsQueried = UniqueTargets,
+    FirstQueryTime = FirstQuery,
+    LastQueryTime = LastQuery,
+    Severity = case(
+        FailedDirectoryQueries >= 50, "High",
+        FailedDirectoryQueries >= 20, "Medium",
+        "Low"
+    )
+*/
+
+// TUNING PARAMETERS:
+// FailedAttemptCount >= 10: Adjust based on your environment (5, 10, 20)
+// UniqueAttemptedUsers >= 5: Minimum users targeted before triggering (3, 5, 10)
+// AttemptsPerMinute >= 2: Speed threshold (1, 2, 5 attempts/min)
+// ResultType values: Can add/remove failure codes based on your focus
+// TimeGenerated > ago(24h): Adjust lookback window (6h, 24h, 7d)
+
+// NOTES:
+// - Account enumeration = reconnaissance phase of attack
+// - Attackers try common usernames: admin, test, administrator, service
+// - Rapid attempts from single IP = automated enumeration tool
+// - Multiple users targeted = broader enumeration vs targeted
+// - Often precedes credential spray or targeted phishing
+// - Can identify whether attacker knows valid usernames beforehand
+// - Review SourceIP - may be compromised internal account or external attacker
+// - Service accounts may legitimately query user accounts (false positives)
+// - API-based enumeration harder to detect (requires audit logging)
+// - Combine with failed login detection for broader context
+// - Geographic anomaly + enumeration = higher compromise likelihood
+// - Users rarely fail authentication repeatedly (except new hires learning)
+// - Can correlate with threat intelligence for known attacker IPs
+// - Monitor for enumeration followed by specific account attacks
