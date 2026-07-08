@@ -1,0 +1,132 @@
+// ============================================
+// QUERY: Impossible Travel Detection
+// MITRE ATT&CK: T1550 - Use Alternate Authentication Material
+// SEVERITY: High
+// AUTHOR: Luvuyo Prince Ntantiso
+// DATE: July 2026
+// ============================================
+
+// Description:
+// Detects impossible travel scenarios where a user authenticates from two
+// geographically distant locations in an impossibly short time window.
+// Indicates credential compromise or account takeover. A user cannot
+// physically travel 1000+ miles in minutes. Legitimate scenarios are rare.
+
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0  // Successful logins only
+| extend
+    UserAccount = UserPrincipalName,
+    LoginCountry = LocationDetails.countryOrRegion,
+    LoginCity = LocationDetails.city,
+    LoginLatitude = LocationDetails.geoCoordinates.latitude,
+    LoginLongitude = LocationDetails.geoCoordinates.longitude,
+    SourceIP = IPAddress,
+    AuthMethod = AuthenticationDetails[0].authenticationMethod,
+    DeviceInfo = DeviceDetail.displayName
+| where LoginCountry != ""  // Must have location data
+| summarize
+    LoginCount = count(),
+    UniqueCountries = dcount(LoginCountry),
+    UniqueCities = dcount(LoginCity),
+    FirstLogin = min(TimeGenerated),
+    LastLogin = max(TimeGenerated),
+    Countries = make_set(LoginCountry),
+    Cities = make_set(LoginCity),
+    Latitudes = make_set(LoginLatitude),
+    Longitudes = make_set(LoginLongitude),
+    SourceIPs = make_set(SourceIP),
+    DeviceNames = make_set(DeviceInfo)
+    by UserAccount
+| where UniqueCountries >= 2  // At least 2 different countries
+| extend
+    TimeDifferenceBetweenLogins = LastLogin - FirstLogin,
+    TimeDifferenceMinutes = totimespan(TimeDifferenceBetweenLogins).TotalMinutes
+| where TimeDifferenceMinutes <= 120  // Within 2 hours (120 minutes)
+| extend
+    // Approximate distance calculation (Haversine formula simplified)
+    // This is a rough estimate - actual calculation would be more precise
+    DistanceIndicator = case(
+        UniqueCountries == 2 and TimeDifferenceMinutes <= 60, "Likely Impossible",
+        UniqueCountries >= 3 and TimeDifferenceMinutes <= 120, "Highly Suspicious",
+        "Suspicious"
+    )
+| project
+    UserAccount = UserAccount,
+    LoginCount = LoginCount,
+    UniqueCountriesCount = UniqueCountries,
+    UniqueCitiesCount = UniqueCities,
+    CountriesDetected = Countries,
+    CitiesDetected = Cities,
+    SourceIPsDetected = SourceIPs,
+    DevicesUsed = DeviceNames,
+    TimeWindowMinutes = TimeDifferenceMinutes,
+    FirstLoginTime = FirstLogin,
+    LastLoginTime = LastLogin,
+    ImpossibleTravelIndicator = DistanceIndicator,
+    Severity = case(
+        (DistanceIndicator == "Likely Impossible"), "Critical",
+        (DistanceIndicator == "Highly Suspicious"), "High",
+        "Medium"
+    )
+| sort by TimeWindowMinutes asc  // Shortest time window = most suspicious
+
+// ALTERNATIVE: More precise distance-based detection
+// Uncomment to use this version instead:
+/*
+let login_data = SigninLogs
+| where ResultType == 0
+| where TimeGenerated > ago(7d)
+| extend
+    UserAccount = UserPrincipalName,
+    LoginCountry = LocationDetails.countryOrRegion,
+    LoginLatitude = LocationDetails.geoCoordinates.latitude,
+    LoginLongitude = LocationDetails.geoCoordinates.longitude,
+    EventTime = TimeGenerated
+| where LoginCountry != "";
+
+login_data
+| join kind=inner (login_data) on UserAccount
+| where EventTime < EventTime1 and EventTime1 - EventTime <= 2h
+| extend
+    LatDiff = abs(LoginLatitude - LoginLatitude1),
+    LonDiff = abs(LoginLongitude - LoginLongitude1),
+    // Rough distance in degrees (111 km per degree approx)
+    ApproximateDistanceKm = sqrt((LatDiff * 111) ^ 2 + (LonDiff * 111) ^ 2)
+| where ApproximateDistanceKm > 900  // More than 900 km apart
+| project
+    UserAccount = UserAccount,
+    FirstLoginCountry = LoginCountry,
+    SecondLoginCountry = LoginCountry1,
+    ApproximateDistanceKm = ApproximateDistanceKm,
+    FirstLoginTime = EventTime,
+    SecondLoginTime = EventTime1,
+    TimeGapMinutes = (EventTime1 - EventTime) / 1m,
+    Severity = case(
+        ApproximateDistanceKm > 3000 and (EventTime1 - EventTime) < 60m, "Critical",
+        ApproximateDistanceKm > 1500 and (EventTime1 - EventTime) < 120m, "High",
+        "Medium"
+    )
+| sort by ApproximateDistanceKm desc
+*/
+
+// TUNING PARAMETERS:
+// UniqueCountries >= 2: Minimum countries (2 = baseline)
+// TimeDifferenceMinutes <= 120: Time window threshold (60min = stricter, 240min = looser)
+// ResultType == 0: Only successful logins (can include failed with ResultType != 0)
+// LocationDetails filtering: Adjust based on false positive rate
+// Distance threshold: Use 900km for general, 500km for strict, 1500km for loose
+
+// NOTES:
+// - Impossible travel = strong indicator of account compromise
+// - Average flight speed = 900 km/hour (500 km practical minimum)
+// - 2-hour window = most suspicious (tight timeframe, long distance)
+// - VPNs can complicate detection (appear in different countries)
+// - Business travel may generate legitimate alerts (account owner traveling)
+// - Review SourceIPs - same IP for both logins = false positive (VPN)
+// - Corporate VPN users may appear in different countries (false positives)
+// - Newly compromised accounts show this pattern immediately
+// - Correlate with failed login attempts before successful login
+// - Can combine with risk score from other detections
+// - Consider time zones and shift workers for false positive reduction
+// - Multiple countries in single day = check if legitimate business travel
